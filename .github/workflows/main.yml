@@ -1,4 +1,4 @@
-name: CI for KodeKloud
+name: CI for WindsurfUserSetup
 on:
   push:
   workflow_dispatch:
@@ -18,6 +18,56 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
           Set-LocalUser -Name "${{ env.RDP_USERNAME }}" -Password (ConvertTo-SecureString -AsPlainText "${{ env.RDP_PASSWORD }}" -Force)
       
+      - name: Allow multiple RDP connections on Windows Server 2022 Version 21H2 (OS Build 20348)
+        run: |
+          # File paths
+          $termsrvDllFile = "$env:SystemRoot\System32\termsrv.dll"
+          $termsrvDllCopy = "$env:SystemRoot\System32\termsrv.dll.copy"
+
+          # Stop Terminal Service
+          Stop-Service -Name TermService -Force
+
+          # Backup ACL and original file
+          $termsrvDllAcl = Get-Acl -Path $termsrvDllFile
+          Copy-Item -Path $termsrvDllFile -Destination $termsrvDllCopy -Force
+
+          # Take ownership and grant access rights
+          takeown.exe /F $termsrvDllFile > $null
+          $currentUserName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          icacls.exe $termsrvDllFile /grant "$($currentUserName):F" > $null
+
+          # Read file as byte array and prepare for replacement
+          $dllAsByte = [System.IO.File]::ReadAllBytes($termsrvDllFile)
+          $dllAsText = ($dllAsByte | ForEach-Object { $_.ToString('X2') }) -join ' '
+
+          # Define byte pattern to find RDP connection limit code (flexible to match multiple Windows versions)
+          $pattern = [regex]'39 81 3C 06 00 00 0F (?:[0-9A-F]{2} ){4}00'
+          $replacement = 'B8 00 01 00 00 89 81 38 06 00 00 90'
+
+          # Check if the pattern is found
+          $match = $dllAsText -match $pattern
+
+          if ($match) {
+              # Perform replacement
+              $dllAsTextReplaced = $dllAsText -replace $pattern, $replacement
+              [byte[]] $dllAsBytesReplaced = -split $dllAsTextReplaced -replace '^', '0x'
+              
+              # Write directly to the original file
+              [System.IO.File]::WriteAllBytes($termsrvDllFile, $dllAsBytesReplaced)
+          }
+
+          # Restore permissions
+          Set-Acl -Path $termsrvDllFile -AclObject $termsrvDllAcl
+
+          # Restart the service
+          Start-Service TermService
+      
+      - name: Download and Install WindsurfUserSetup
+        run: |
+          Start-BitsTransfer -Source "https://windsurf-stable.codeiumdata.com/win32-x64-user/stable/b3241b91445f79878ccc91626dfe190f90563e53/WindsurfUserSetup-x64-1.5.9.exe" -Destination ".\WindsurfUserSetup-x64-1.5.9.exe"
+          Start-Process -FilePath ".\WindsurfUserSetup-x64-1.5.9.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Verb RunAs
+          Start-Process "msedge.exe" -ArgumentList "--no-first-run", "--no-default-browser-check", "--start-maximized", "https://codeium.com/account/register", "https://mail.tm/"
+
       - name: Download and Extract ngrok for creating secure tunnels
         run: |
           Start-BitsTransfer -Source "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -Destination ".\ngrok.zip"
@@ -28,6 +78,20 @@ jobs:
         run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      
+      - name: Create multiple user accounts for RDP access
+        run: |
+          # Create secure password for accounts
+          $Password = ConvertTo-SecureString -String "P@ssw0rd!" -AsPlainText -Force
+          
+          # Create 10 user accounts
+          for ($i = 1; $i -le 10; $i++) {
+              # Create or update account
+              New-LocalUser -Name "runner$i" -Password $Password -FullName "Runner User $i" -Description "Additional RDP user" -AccountNeverExpires -ErrorAction SilentlyContinue
+              
+              # Add account to Remote Desktop Users group
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runner$i" -ErrorAction SilentlyContinue
+          }
       
       - name: Start ngrok in background and get tunnel info
         run: |
@@ -44,6 +108,9 @@ jobs:
           Write-Host "NGROK Public URL: $publicUrl"
           Write-Host "Primary Username: ${{ env.RDP_USERNAME }}"
           Write-Host "Primary Password: ${{ env.RDP_PASSWORD }}"
+          Write-Host ""
+          Write-Host "Additional users: runner1 through runner10"
+          Write-Host "Password for all accounts: P@ssw0rd!"
           Write-Host "=============================================="
           
           # Keep the GitHub Actions runner active to allow RDP connections
